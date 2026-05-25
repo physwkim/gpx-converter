@@ -1,0 +1,5 @@
+/target
+.DS_Store
+
+# Personal example GPS data — kept local, not published.
+/ref/
