@@ -1,8 +1,8 @@
-//! GPX -> TCX 변환 웹서버 (axum).
+//! GPX -> TCX conversion web server (axum).
 //!
-//! VPN 안에서 혼자 쓰는 자체 호스팅 변환기. 휴대폰에서 페이지를 열고 GPX를
-//! 업로드하면 서버가 TCX Course로 변환해 첨부(attachment)로 돌려주므로 바로
-//! 다운로드된다. 변환 로직은 [`convert`] 모듈.
+//! A self-hosted converter for personal use behind a VPN. Open the page on your
+//! phone, upload a GPX, and the server converts it to a TCX Course and returns
+//! it as an attachment so it downloads immediately. See the [`convert`] module.
 
 mod convert;
 
@@ -15,18 +15,18 @@ use axum::{
 };
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-/// 업로드 본문 최대 크기(대형 경로 대비). 기본 2MB로는 부족할 수 있다.
+/// Max upload body size (for large routes). The default 2 MB can be too small.
 const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
-/// 기본 포트(env `PORT`로 재정의 가능).
+/// Default port (overridable via the `PORT` env var).
 const DEFAULT_PORT: u16 = 8080;
 
 const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GPX → TCX 변환</title>
+<title>GPX → TCX Converter</title>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, -apple-system, sans-serif; margin: 0;
@@ -44,11 +44,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </head>
 <body>
 <main>
-  <h1>GPX → TCX 변환</h1>
-  <p>GPX 경로 파일을 올리면 사이클링 컴퓨터용 TCX 코스 파일로 변환되어 바로 내려받아집니다.</p>
+  <h1>GPX → TCX Converter</h1>
+  <p>Upload a GPX route file and it is converted to a TCX course file for your cycling computer and downloaded right away.</p>
   <form method="post" action="/convert" enctype="multipart/form-data">
     <input type="file" name="file" accept=".gpx,application/gpx+xml" required>
-    <button type="submit">변환 &amp; 다운로드</button>
+    <button type="submit">Convert &amp; Download</button>
   </form>
 </main>
 </body>
@@ -70,9 +70,9 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .unwrap_or_else(|e| panic!("{addr} 바인드 실패: {e}"));
+        .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
     println!("gpx-converter listening on http://{addr}");
-    axum::serve(listener, app).await.expect("서버 실행 실패");
+    axum::serve(listener, app).await.expect("server failed");
 }
 
 async fn index() -> Html<&'static str> {
@@ -95,7 +95,10 @@ async fn convert_handler(mut multipart: Multipart) -> Response {
                     match field.bytes().await {
                         Ok(b) => file_bytes = Some(b.to_vec()),
                         Err(e) => {
-                            return (StatusCode::BAD_REQUEST, format!("업로드 읽기 실패: {e}"))
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!("failed to read upload: {e}"),
+                            )
                                 .into_response()
                         }
                     }
@@ -103,7 +106,7 @@ async fn convert_handler(mut multipart: Multipart) -> Response {
             }
             Ok(None) => break,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("multipart 오류: {e}")).into_response()
+                return (StatusCode::BAD_REQUEST, format!("multipart error: {e}")).into_response()
             }
         }
     }
@@ -111,7 +114,7 @@ async fn convert_handler(mut multipart: Multipart) -> Response {
     let Some(bytes) = file_bytes else {
         return (
             StatusCode::BAD_REQUEST,
-            "파일이 없습니다. GPX 파일을 선택하세요.".to_string(),
+            "No file. Please choose a GPX file.".to_string(),
         )
             .into_response();
     };
@@ -119,7 +122,7 @@ async fn convert_handler(mut multipart: Multipart) -> Response {
     match convert::gpx_to_tcx(&bytes, &file_name) {
         Ok(tcx) => {
             let download = format!("{}.tcx", tcx.filename);
-            // 한글 파일명은 RFC 5987 filename*로 전달. ASCII 폴백도 함께 둔다.
+            // Non-ASCII filenames (e.g. Korean) go via RFC 5987 filename*; an ASCII fallback is kept too.
             let encoded = utf8_percent_encode(&download, NON_ALPHANUMERIC).to_string();
             let disposition =
                 format!("attachment; filename=\"route.tcx\"; filename*=UTF-8''{encoded}");

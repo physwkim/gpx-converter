@@ -1,17 +1,18 @@
-//! GPX -> TCX Course 변환.
+//! GPX -> TCX Course conversion.
 //!
-//! 출력 형식은 맵앱이 만든 TCX Course 파일을 역공학해 맞췄다.
-//! 핵심 규칙은 거리 누적(Haversine) + 20 km/h 등속으로 시각을 합성하는 것.
-//! 맵앱 전용 비표준 속성(sectionIndex 등)은 생성하지 않는다 — 표준 TCX 부분집합.
+//! The output format was reverse-engineered from a TCX Course file produced by a
+//! map app. The core rules: accumulate distance (Haversine) and synthesize
+//! timestamps assuming a constant 20 km/h. Map-app-specific non-standard
+//! attributes (sectionIndex, etc.) are not emitted — a standard TCX subset.
 
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use std::io::Cursor;
 
-/// 예제가 사용한 속도. 거리/시간 합성에 쓰인다 (= 20 km/h).
-/// 검증: point5 거리 382.62 m / 5.5556 = 68.9 s, 시작 22:04:07 + 68 s = 22:05:15 (예제 일치).
+/// Speed used by the example; drives distance/time synthesis (= 20 km/h).
+/// Verified: point5 distance 382.62 m / 5.5556 = 68.9 s, start 22:04:07 + 68 s = 22:05:15 (matches example).
 const SPEED_MPS: f64 = 5.5556;
 
-/// 코스 이름 최대 길이(문자 수). 일부 기기가 긴 이름을 자르므로 미리 제한한다.
+/// Max course-name length (chars). Some devices truncate long names, so cap it up front.
 const MAX_NAME_CHARS: usize = 50;
 
 struct Pt {
@@ -20,19 +21,19 @@ struct Pt {
     ele: Option<f64>,
 }
 
-/// 변환 결과: 다운로드 파일명 stem(확장자 제외)과 TCX XML 본문.
+/// Conversion result: the download filename stem (without extension) and the TCX XML body.
 pub struct Tcx {
     pub filename: String,
     pub xml: String,
 }
 
-/// GPX 바이트를 TCX Course XML로 변환한다.
+/// Converts GPX bytes into TCX Course XML.
 ///
-/// `upload_name`은 업로드된 원본 파일명(이름 폴백 및 다운로드 파일명 stem에 사용).
+/// `upload_name` is the original uploaded filename (used for the name fallback and download stem).
 pub fn gpx_to_tcx(bytes: &[u8], upload_name: &str) -> Result<Tcx, String> {
-    let gpx = gpx::read(Cursor::new(bytes)).map_err(|e| format!("GPX 파싱 실패: {e}"))?;
+    let gpx = gpx::read(Cursor::new(bytes)).map_err(|e| format!("failed to parse GPX: {e}"))?;
 
-    // 점 추출: 트랙 -> 라우트 -> 웨이포인트 순으로 폴백.
+    // Extract points: tracks -> routes -> waypoints, in fallback order.
     let mut pts: Vec<Pt> = Vec::new();
     for trk in &gpx.tracks {
         for seg in &trk.segments {
@@ -69,10 +70,10 @@ pub fn gpx_to_tcx(bytes: &[u8], upload_name: &str) -> Result<Tcx, String> {
         }
     }
     if pts.is_empty() {
-        return Err("GPX에 좌표 점이 없습니다.".to_string());
+        return Err("The GPX has no coordinate points.".to_string());
     }
 
-    // 이름: metadata.name -> 첫 트랙 name -> 파일명 stem -> "Course".
+    // Name: metadata.name -> first track name -> filename stem -> "Course".
     let stem = file_stem(upload_name);
     let name = gpx
         .metadata
@@ -88,7 +89,7 @@ pub fn gpx_to_tcx(bytes: &[u8], upload_name: &str) -> Result<Tcx, String> {
         .or_else(|| (!stem.is_empty()).then(|| stem.clone()))
         .unwrap_or_else(|| "Course".to_string());
 
-    // 누적 거리(Haversine). 첫 점은 0.
+    // Cumulative distance (Haversine). The first point is 0.
     let mut cum = vec![0.0_f64; pts.len()];
     for i in 1..pts.len() {
         let d = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
@@ -96,7 +97,7 @@ pub fn gpx_to_tcx(bytes: &[u8], upload_name: &str) -> Result<Tcx, String> {
     }
     let total = *cum.last().unwrap();
 
-    // 시작 시각은 변환 시점의 현재 UTC. 코스 추종에는 절대 시각이 무의미하므로 무방.
+    // Start time is the current UTC at conversion. Absolute time is irrelevant for course following, so it's fine.
     let start = Utc::now();
     let at = |secs: f64| -> String {
         let ms = (secs * 1000.0) as i64;
@@ -120,7 +121,7 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
         xml_escape(&clamp_name(&name))
     ));
 
-    // Lap: 총시간/총거리/시작·끝 좌표.
+    // Lap: total time/distance and begin/end positions.
     s.push_str("<Lap>\n");
     s.push_str(&format!(
         "<TotalTimeSeconds>{:.0}</TotalTimeSeconds>\n",
@@ -137,7 +138,7 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
     ));
     s.push_str("<Intensity>Active</Intensity>\n</Lap>\n");
 
-    // Track: 점마다 Trackpoint 하나.
+    // Track: one Trackpoint per point.
     s.push_str("<Track>\n");
     for (i, p) in pts.iter().enumerate() {
         s.push_str("<Trackpoint>");
@@ -154,7 +155,7 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
     }
     s.push_str("</Track>\n");
 
-    // CoursePoint: 시작점 하나(Generic). 예제와 동일한 최소 구성.
+    // CoursePoint: a single Start point (Generic). Minimal, matching the example.
     s.push_str("<CoursePoint><Name>Start</Name>");
     s.push_str(&format!("<Time>{}</Time>", at(0.0)));
     s.push_str(&format!(
@@ -176,9 +177,9 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
     Ok(Tcx { filename, xml: s })
 }
 
-/// 두 위경도 좌표 사이의 대원 거리(m). 외부 크레이트 없이 직접 구현.
+/// Great-circle distance (m) between two lat/lon coordinates. No external crate.
 fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0; // 지구 평균 반지름(m)
+    const R: f64 = 6_371_000.0; // Earth mean radius (m)
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
@@ -187,7 +188,7 @@ fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     R * c
 }
 
-/// XML 텍스트 이스케이프(요소 내용·이름용).
+/// XML text escaping (for element content / names).
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -203,7 +204,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// 경로 구분자를 제거하고 마지막 확장자를 떼어낸 파일명 stem.
+/// Filename stem with path separators removed and the last extension stripped.
 fn file_stem(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     match base.rsplit_once('.') {
@@ -212,7 +213,7 @@ fn file_stem(name: &str) -> String {
     }
 }
 
-/// 앞뒤 공백 제거 후 문자 수 기준으로 이름을 자른다(UTF-8 경계 안전).
+/// Trims surrounding whitespace, then truncates by char count (UTF-8 boundary safe).
 fn clamp_name(s: &str) -> String {
     s.trim().chars().take(MAX_NAME_CHARS).collect()
 }
@@ -221,9 +222,10 @@ fn clamp_name(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // 자오선(같은 경도)을 따라 위도만 0.01°씩 증가하는 합성 경로. 개인 데이터 없음.
-    // 자오선에서 Haversine 거리는 R*Δlat 와 정확히 같으므로 거리가 결정적이다:
-    // 0.01° = 6_371_000 * 0.01 * π/180 ≈ 1111.95 m, 4구간 → ≈ 4447.80 m.
+    // Synthetic route along a meridian (same longitude); latitude increases by
+    // 0.01° each step. No personal data. Along a meridian the Haversine distance
+    // equals R*Δlat exactly, so distances are deterministic:
+    // 0.01° = 6_371_000 * 0.01 * π/180 ≈ 1111.95 m, 4 segments → ≈ 4447.80 m.
     const SYNTHETIC_GPX: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
 <metadata><name>Test Route</name></metadata>
@@ -244,20 +246,20 @@ mod tests {
 
     #[test]
     fn converts_track_to_course() {
-        let tcx = gpx_to_tcx(SYNTHETIC_GPX, "route.gpx").expect("변환 성공");
+        let tcx = gpx_to_tcx(SYNTHETIC_GPX, "route.gpx").expect("conversion succeeds");
 
-        // trkpt 5개 -> Trackpoint 5개. 비표준 속성 없는 깨끗한 형태.
+        // 5 trkpt -> 5 Trackpoints; clean form without non-standard attributes.
         assert_eq!(
             count_occurrences(&tcx.xml, "<Trackpoint>"),
             5,
-            "Trackpoint 개수"
+            "trackpoint count"
         );
         assert!(
             tcx.xml.contains("<Trackpoint><Time>"),
-            "Trackpoint에 속성이 붙음"
+            "Trackpoint must have no attributes"
         );
 
-        // 필수 구조 존재.
+        // Required structure present.
         for tag in [
             "<Courses>",
             "<Course>",
@@ -268,26 +270,26 @@ mod tests {
             "<PointType>Generic</PointType>",
             "<AltitudeMeters>10.00</AltitudeMeters>",
         ] {
-            assert!(tcx.xml.contains(tag), "누락: {tag}");
+            assert!(tcx.xml.contains(tag), "missing: {tag}");
         }
 
-        // 이름은 GPX metadata의 name.
-        assert!(tcx.xml.contains("<Name>Test Route</Name>"), "코스 이름");
+        // Name comes from the GPX metadata name.
+        assert!(tcx.xml.contains("<Name>Test Route</Name>"), "course name");
     }
 
     #[test]
     fn cumulative_distance_is_monotonic_and_correct() {
         let tcx = gpx_to_tcx(SYNTHETIC_GPX, "route.gpx").unwrap();
 
-        // Track 구간만 떼어내 Trackpoint의 DistanceMeters만 본다(Lap 총거리 제외).
+        // Take only the Track section so we read Trackpoint DistanceMeters (excluding the Lap total).
         let track = tcx
             .xml
             .split("<Track>")
             .nth(1)
             .and_then(|s| s.split("</Track>").next())
-            .expect("Track 구간");
+            .expect("Track section");
 
-        // DistanceMeters 값을 순서대로 추출.
+        // Extract DistanceMeters values in order.
         let mut dists = Vec::new();
         for chunk in track.split("<DistanceMeters>").skip(1) {
             let v: f64 = chunk
@@ -298,21 +300,21 @@ mod tests {
                 .unwrap();
             dists.push(v);
         }
-        assert_eq!(dists.len(), 5, "Trackpoint 거리 개수");
-        assert_eq!(dists[0], 0.0, "첫 점 거리 0");
+        assert_eq!(dists.len(), 5, "trackpoint distance count");
+        assert_eq!(dists[0], 0.0, "first point distance is 0");
         for w in dists.windows(2) {
-            assert!(w[1] >= w[0], "거리 단조 증가 위반: {} -> {}", w[0], w[1]);
+            assert!(w[1] >= w[0], "distance not monotonic: {} -> {}", w[0], w[1]);
             assert!(
                 (w[1] - w[0] - SEGMENT_M).abs() < 1.0,
-                "구간 거리 {} 가 예상과 다름",
+                "segment distance {} differs from expected",
                 w[1] - w[0]
             );
         }
-        // 총거리 = 4 * SEGMENT_M ≈ 4447.80 m.
+        // Total = 4 * SEGMENT_M ≈ 4447.80 m.
         let total = *dists.last().unwrap();
         assert!(
             (total - 4.0 * SEGMENT_M).abs() < 1.0,
-            "총거리 {total} 불일치"
+            "total distance {total} mismatch"
         );
     }
 
@@ -325,11 +327,14 @@ mod tests {
 <trkpt lat=\"35.001\" lon=\"129.001\"></trkpt>\
 </trkseg></trk></gpx>";
         let tcx = gpx_to_tcx(gpx, "my ride.gpx").unwrap();
-        assert!(tcx.xml.contains("<Name>my ride</Name>"), "파일명 stem 폴백");
-        // 고도 없는 점 -> AltitudeMeters 미출력.
+        assert!(
+            tcx.xml.contains("<Name>my ride</Name>"),
+            "filename stem fallback"
+        );
+        // No-elevation point -> AltitudeMeters omitted.
         assert!(
             !tcx.xml.contains("<AltitudeMeters>"),
-            "ele 없으면 AltitudeMeters 없음"
+            "no ele -> no AltitudeMeters"
         );
         assert_eq!(tcx.filename, "my ride");
     }
