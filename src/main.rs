@@ -47,7 +47,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <h1>GPX → TCX Converter</h1>
   <p>Upload a GPX route file and it is converted to a TCX course file for your cycling computer and downloaded right away.</p>
   <form method="post" action="/convert" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".gpx,application/gpx+xml" required>
+    <!-- No accept filter: iOS resolves accept tokens to UTIs and has none for
+         .gpx/application/gpx+xml, so any filter greys out every file in the
+         picker. The server validates by parsing, so the picker need not filter. -->
+    <input type="file" name="file" required>
     <button type="submit">Convert &amp; Download</button>
   </form>
 </main>
