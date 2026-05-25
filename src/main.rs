@@ -47,10 +47,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <h1>GPX → TCX Converter</h1>
   <p>Upload a GPX route file and it is converted to a TCX course file for your cycling computer and downloaded right away.</p>
   <form method="post" action="/convert" enctype="multipart/form-data">
-    <!-- No accept filter: iOS resolves accept tokens to UTIs and has none for
-         .gpx/application/gpx+xml, so any filter greys out every file in the
-         picker. The server validates by parsing, so the picker need not filter. -->
-    <input type="file" name="file" required>
+    <!-- accept="application/octet-stream" does two things on iOS: it is a
+         document (non-media) type, so the picker opens the Files browser
+         directly instead of the Photo Library / Camera action sheet; and it
+         maps to the UTI public.data, which every file conforms to, so the .gpx
+         is never greyed out (mapping the custom .gpx extension to a UTI fails
+         and would grey it). The server still validates by parsing the bytes. -->
+    <input type="file" name="file" accept="application/octet-stream" required>
     <button type="submit">Convert &amp; Download</button>
   </form>
 </main>
