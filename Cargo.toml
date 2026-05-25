@@ -7,6 +7,9 @@ license = "MIT"
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-gpx = "0.10"
+# Lenient, read-only XML tree. Real-world GPX exports (e.g. kakaomap) carry
+# non-standard elements that a schema-strict GPX crate rejects; we only need
+# leaf data (lat/lon/ele + names), so parse the XML directly and ignore the rest.
+roxmltree = "0.20"
 chrono = "0.4"
 percent-encoding = "2"

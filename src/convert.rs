@@ -6,7 +6,7 @@
 //! attributes (sectionIndex, etc.) are not emitted — a standard TCX subset.
 
 use chrono::{SecondsFormat, TimeDelta, Utc};
-use std::io::Cursor;
+use roxmltree::{Document, Node};
 
 /// Speed used by the example; drives distance/time synthesis (= 20 km/h).
 /// Verified: point5 distance 382.62 m / 5.5556 = 68.9 s, start 22:04:07 + 68 s = 22:05:15 (matches example).
@@ -31,61 +31,40 @@ pub struct Tcx {
 ///
 /// `upload_name` is the original uploaded filename (used for the name fallback and download stem).
 pub fn gpx_to_tcx(bytes: &[u8], upload_name: &str) -> Result<Tcx, String> {
-    let gpx = gpx::read(Cursor::new(bytes)).map_err(|e| format!("failed to parse GPX: {e}"))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "The file is not valid UTF-8 text.".to_string())?;
+    let doc = Document::parse(text).map_err(|e| format!("failed to parse the file as XML: {e}"))?;
+    let root = doc.root_element();
 
-    // Extract points: tracks -> routes -> waypoints, in fallback order.
-    let mut pts: Vec<Pt> = Vec::new();
-    for trk in &gpx.tracks {
-        for seg in &trk.segments {
-            for wp in &seg.points {
-                let p = wp.point();
-                pts.push(Pt {
-                    lat: p.y(),
-                    lon: p.x(),
-                    ele: wp.elevation,
-                });
-            }
-        }
+    // Extract points: tracks -> routes -> waypoints, in fallback order. Lenient by
+    // design — only lat/lon/ele are read; any non-standard sibling elements that
+    // real-world exports add (kakaomap's <description>, <extensions>/<kakaomap-meta>,
+    // etc.) are ignored rather than rejected.
+    let mut pts = collect_points(root, "trkpt");
+    if pts.is_empty() {
+        pts = collect_points(root, "rtept");
     }
     if pts.is_empty() {
-        for rte in &gpx.routes {
-            for wp in &rte.points {
-                let p = wp.point();
-                pts.push(Pt {
-                    lat: p.y(),
-                    lon: p.x(),
-                    ele: wp.elevation,
-                });
-            }
-        }
-    }
-    if pts.is_empty() {
-        for wp in &gpx.waypoints {
-            let p = wp.point();
-            pts.push(Pt {
-                lat: p.y(),
-                lon: p.x(),
-                ele: wp.elevation,
-            });
-        }
+        pts = collect_points(root, "wpt");
     }
     if pts.is_empty() {
         return Err("The GPX has no coordinate points.".to_string());
     }
 
-    // Name: metadata.name -> first track name -> filename stem -> "Course".
+    // Name: metadata/name -> first trk/name -> filename stem -> "Course".
+    // Scoped lookups so a <wpt>/<rtept> <name> (a POI label) is never mistaken
+    // for the course name.
     let stem = file_stem(upload_name);
-    let name = gpx
-        .metadata
-        .as_ref()
-        .and_then(|m| m.name.clone())
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            gpx.tracks
-                .first()
-                .and_then(|t| t.name.clone())
-                .filter(|s| !s.trim().is_empty())
-        })
+    let meta_name = root
+        .children()
+        .find(|c| c.is_element() && c.tag_name().name() == "metadata")
+        .and_then(|m| child_text(m, "name"));
+    let trk_name = root
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "trk")
+        .and_then(|t| child_text(t, "name"));
+    let name = meta_name
+        .or(trk_name)
         .or_else(|| (!stem.is_empty()).then(|| stem.clone()))
         .unwrap_or_else(|| "Course".to_string());
 
@@ -186,6 +165,37 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
         stem
     };
     Ok(Tcx { filename, xml: s })
+}
+
+/// Collects points with the given tag name (`trkpt`/`rtept`/`wpt`) anywhere under
+/// `root`. Namespace prefixes are ignored (matched by local name). A point needs
+/// numeric `lat`/`lon` attributes; `<ele>` is optional. Any other child element is
+/// ignored, so non-standard `<extensions>` and the like never break extraction.
+fn collect_points(root: Node, tag: &str) -> Vec<Pt> {
+    root.descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == tag)
+        .filter_map(|n| {
+            let lat = n.attribute("lat")?.trim().parse::<f64>().ok()?;
+            let lon = n.attribute("lon")?.trim().parse::<f64>().ok()?;
+            let ele = n
+                .children()
+                .find(|c| c.is_element() && c.tag_name().name() == "ele")
+                .and_then(|c| c.text())
+                .and_then(|t| t.trim().parse::<f64>().ok());
+            Some(Pt { lat, lon, ele })
+        })
+        .collect()
+}
+
+/// Trimmed text of `parent`'s first direct child element with the given local
+/// name, or `None` if absent or blank.
+fn child_text(parent: Node, tag: &str) -> Option<String> {
+    parent
+        .children()
+        .find(|c| c.is_element() && c.tag_name().name() == tag)
+        .and_then(|c| c.text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Great-circle distance (m) between two lat/lon coordinates. No external crate.
@@ -403,6 +413,53 @@ mod tests {
         assert!(
             tcx.xml.contains("<TotalTimeSeconds>4</TotalTimeSeconds>"),
             "Lap total derives from the strictly-increasing series"
+        );
+    }
+
+    #[test]
+    fn tolerates_nonstandard_metadata_and_extensions() {
+        // Mirrors a kakaomap export (synthetic coordinates): <description> in
+        // <metadata> is not GPX-standard, and <wpt>/<trkpt> carry custom
+        // <extensions><kakaomap-meta> children. The lenient parser must ignore all
+        // of it and still extract the track. A schema-strict parser rejected this.
+        let gpx = br#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1" creator="kakaomap-route">
+  <metadata>
+    <name>kakaomap</name>
+    <description>iOS,26.5,iPhone</description>
+    <time>2026-05-26T05:21:20Z</time>
+  </metadata>
+  <wpt lat="35.000000" lon="129.000000">
+    <name>start poi</name>
+    <extensions><kakaomap-meta><route_type>START</route_type></kakaomap-meta></extensions>
+  </wpt>
+  <trk><trkseg>
+    <trkpt lat="35.000000" lon="129.000000"><ele>10.0</ele></trkpt>
+    <trkpt lat="35.010000" lon="129.000000"><ele>12.0</ele>
+      <extensions><kakaomap-meta><line_type>NONE</line_type></kakaomap-meta></extensions></trkpt>
+  </trkseg></trk>
+</gpx>"#;
+        let tcx = gpx_to_tcx(gpx, "kakao.gpx").unwrap();
+
+        // The track (2 trkpt) wins over the 2 wpt POIs.
+        assert_eq!(
+            count_occurrences(&tcx.xml, "<Trackpoint>"),
+            2,
+            "track points extracted despite non-standard sibling elements"
+        );
+        assert!(
+            tcx.xml.contains("<AltitudeMeters>10.00</AltitudeMeters>"),
+            "trkpt elevation read past the <extensions>"
+        );
+        // Course name from <metadata><name>, not the <wpt> POI <name>.
+        assert!(
+            tcx.xml.contains("<Name>kakaomap</Name>"),
+            "metadata name used, not the waypoint POI name"
+        );
+        // No custom element leaks into the output.
+        assert!(
+            !tcx.xml.contains("kakaomap-meta") && !tcx.xml.contains("route_type"),
+            "non-standard elements must not appear in the TCX"
         );
     }
 
