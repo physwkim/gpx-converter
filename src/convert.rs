@@ -405,4 +405,102 @@ mod tests {
             "Lap total derives from the strictly-increasing series"
         );
     }
+
+    #[test]
+    fn falls_back_to_route_points_when_no_track() {
+        // No <trk>: points must come from <rte>/<rtept>, with elevation carried.
+        let gpx = br#"<?xml version="1.0"?>
+<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">
+<rte>
+<rtept lat="35.000000" lon="129.000000"><ele>5.0</ele></rtept>
+<rtept lat="35.010000" lon="129.000000"><ele>6.0</ele></rtept>
+</rte></gpx>"#;
+        let tcx = gpx_to_tcx(gpx, "route-only.gpx").unwrap();
+        assert_eq!(
+            count_occurrences(&tcx.xml, "<Trackpoint>"),
+            2,
+            "route points become Trackpoints"
+        );
+        assert!(
+            tcx.xml.contains("<AltitudeMeters>5.00</AltitudeMeters>"),
+            "rtept elevation carried through"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_waypoints_when_no_track_or_route() {
+        // No <trk> and no <rte>: points must come from top-level <wpt>.
+        let gpx = br#"<?xml version="1.0"?>
+<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">
+<wpt lat="35.000000" lon="129.000000"></wpt>
+<wpt lat="35.010000" lon="129.000000"></wpt>
+</gpx>"#;
+        let tcx = gpx_to_tcx(gpx, "waypoints.gpx").unwrap();
+        assert_eq!(
+            count_occurrences(&tcx.xml, "<Trackpoint>"),
+            2,
+            "waypoints become Trackpoints"
+        );
+    }
+
+    #[test]
+    fn escapes_special_chars_in_course_name() {
+        // The GPX entities decode to `A & B < C`; the converter must re-escape them
+        // so the emitted TCX stays well-formed (no raw & or < in element text).
+        let gpx = br#"<?xml version="1.0"?>
+<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">
+<metadata><name>A &amp; B &lt; C</name></metadata>
+<trk><trkseg>
+<trkpt lat="35.0" lon="129.0"/>
+<trkpt lat="35.001" lon="129.001"/>
+</trkseg></trk></gpx>"#;
+        let tcx = gpx_to_tcx(gpx, "x.gpx").unwrap();
+        assert!(
+            tcx.xml.contains("<Name>A &amp; B &lt; C</Name>"),
+            "special chars in the course name must be XML-escaped"
+        );
+    }
+
+    #[test]
+    fn clamps_long_course_name() {
+        // A 60-char name must be capped at MAX_NAME_CHARS in the emitted <Name>.
+        let long = "a".repeat(60);
+        let gpx = format!(
+            r#"<?xml version="1.0"?>
+<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">
+<metadata><name>{long}</name></metadata>
+<trk><trkseg>
+<trkpt lat="35.0" lon="129.0"/>
+<trkpt lat="35.001" lon="129.001"/>
+</trkseg></trk></gpx>"#
+        );
+        let tcx = gpx_to_tcx(gpx.as_bytes(), "x.gpx").unwrap();
+        let name = tcx
+            .xml
+            .split("<Name>")
+            .nth(1)
+            .and_then(|s| s.split("</Name>").next())
+            .expect("course Name");
+        assert_eq!(
+            name.chars().count(),
+            MAX_NAME_CHARS,
+            "course name must be clamped to MAX_NAME_CHARS"
+        );
+    }
+
+    #[test]
+    fn clamp_name_truncates_by_char_not_byte() {
+        // Multibyte input must truncate on char boundaries (no panic, no split byte).
+        let clamped = clamp_name(&"가".repeat(60));
+        assert_eq!(
+            clamped.chars().count(),
+            MAX_NAME_CHARS,
+            "char-count truncation"
+        );
+        assert_eq!(
+            clamped,
+            "가".repeat(MAX_NAME_CHARS),
+            "exactly MAX_NAME_CHARS multibyte chars"
+        );
+    }
 }
