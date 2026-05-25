@@ -29,6 +29,22 @@ PORT=9000 ./target/release/gpx-converter
 
 On start it prints `gpx-converter listening on http://0.0.0.0:8080`.
 
+## Run with Docker Compose
+
+The included `Dockerfile` (multi-stage build → `debian:bookworm-slim`, runs as a
+non-root user) and `docker-compose.yml` give an always-on container.
+
+```sh
+docker compose up -d --build      # build and start in the background
+docker compose logs -f            # follow logs
+docker compose down               # stop and remove
+```
+
+It publishes `8080` on the host (`0.0.0.0`), so the page is reachable at
+`http://<host VPN IP>:8080`. To use a different host port, change the `ports`
+mapping in `docker-compose.yml` (e.g. `"9000:8080"`); `restart: unless-stopped`
+keeps it running across reboots.
+
 ## Access from your phone
 
 1. Run the binary on a machine reachable inside your VPN (home server / PC /

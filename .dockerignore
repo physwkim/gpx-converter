@@ -1,0 +1,15 @@
+# Build artifacts (huge) — rebuilt inside the image.
+target/
+
+# Personal example GPS data — not needed for the build, kept out of the context.
+ref/
+
+# VCS / OS / docs not needed at build time.
+.git/
+.gitignore
+.dockerignore
+.DS_Store
+*.md
+LICENSE
+Dockerfile
+docker-compose.yml
