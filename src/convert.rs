@@ -97,11 +97,23 @@ pub fn gpx_to_tcx(bytes: &[u8], upload_name: &str) -> Result<Tcx, String> {
     }
     let total = *cum.last().unwrap();
 
+    // Per-point elapsed whole seconds, synthesized at SPEED_MPS (floored) but forced
+    // strictly increasing. GPX points closer than ~5.6 m, or exact duplicates (stops),
+    // would otherwise floor to the same second and emit duplicate <Time> values; the
+    // `.max(prev + 1)` makes every Trackpoint time distinct by construction. Sparse
+    // routes are unaffected. Every emitted time — Trackpoints, the Start CoursePoint,
+    // and the Lap total — derives from this single array.
+    let mut secs = vec![0_i64; pts.len()];
+    for i in 1..pts.len() {
+        let ideal = (cum[i] / SPEED_MPS) as i64;
+        secs[i] = ideal.max(secs[i - 1] + 1);
+    }
+    let total_secs = *secs.last().unwrap();
+
     // Start time is the current UTC at conversion. Absolute time is irrelevant for course following, so it's fine.
     let start = Utc::now();
-    let at = |secs: f64| -> String {
-        let ms = (secs * 1000.0) as i64;
-        (start + TimeDelta::milliseconds(ms)).to_rfc3339_opts(SecondsFormat::Secs, true)
+    let at = |elapsed: i64| -> String {
+        (start + TimeDelta::seconds(elapsed)).to_rfc3339_opts(SecondsFormat::Secs, true)
     };
 
     let first = &pts[0];
@@ -124,8 +136,7 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
     // Lap: total time/distance and begin/end positions.
     s.push_str("<Lap>\n");
     s.push_str(&format!(
-        "<TotalTimeSeconds>{:.0}</TotalTimeSeconds>\n",
-        total / SPEED_MPS
+        "<TotalTimeSeconds>{total_secs}</TotalTimeSeconds>\n"
     ));
     s.push_str(&format!("<DistanceMeters>{total:.2}</DistanceMeters>\n"));
     s.push_str(&format!(
@@ -142,7 +153,7 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
     s.push_str("<Track>\n");
     for (i, p) in pts.iter().enumerate() {
         s.push_str("<Trackpoint>");
-        s.push_str(&format!("<Time>{}</Time>", at(cum[i] / SPEED_MPS)));
+        s.push_str(&format!("<Time>{}</Time>", at(secs[i])));
         s.push_str(&format!(
             "<Position><LatitudeDegrees>{:.6}</LatitudeDegrees><LongitudeDegrees>{:.6}</LongitudeDegrees></Position>",
             p.lat, p.lon
@@ -157,7 +168,7 @@ http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd\">\n",
 
     // CoursePoint: a single Start point (Generic). Minimal, matching the example.
     s.push_str("<CoursePoint><Name>Start</Name>");
-    s.push_str(&format!("<Time>{}</Time>", at(0.0)));
+    s.push_str(&format!("<Time>{}</Time>", at(secs[0])));
     s.push_str(&format!(
         "<Position><LatitudeDegrees>{:.6}</LatitudeDegrees><LongitudeDegrees>{:.6}</LongitudeDegrees></Position>",
         first.lat, first.lon
@@ -344,5 +355,54 @@ mod tests {
         let gpx = b"<?xml version=\"1.0\"?>\
 <gpx version=\"1.1\" creator=\"t\" xmlns=\"http://www.topografix.com/GPX/1/1\"></gpx>";
         assert!(gpx_to_tcx(gpx, "empty.gpx").is_err());
+    }
+
+    // Collect the Trackpoint <Time> values from inside <Track>...</Track>.
+    fn trackpoint_times(xml: &str) -> Vec<String> {
+        let track = xml
+            .split("<Track>")
+            .nth(1)
+            .and_then(|s| s.split("</Track>").next())
+            .expect("Track section");
+        track
+            .split("<Time>")
+            .skip(1)
+            .map(|c| c.split("</Time>").next().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn timestamps_strictly_increase_for_dense_and_duplicate_points() {
+        // Points ~3 m apart (< SPEED_MPS) and an exact duplicate (index 1 == 2): all
+        // would floor to the same whole second without the strict-increase clamp.
+        let gpx = br#"<?xml version="1.0"?>
+<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">
+<trk><trkseg>
+<trkpt lat="35.000000" lon="129.000000"/>
+<trkpt lat="35.000027" lon="129.000000"/>
+<trkpt lat="35.000027" lon="129.000000"/>
+<trkpt lat="35.000054" lon="129.000000"/>
+<trkpt lat="35.000081" lon="129.000000"/>
+</trkseg></trk></gpx>"#;
+        let tcx = gpx_to_tcx(gpx, "dense.gpx").unwrap();
+
+        // RFC3339 fixed-width strings compare lexicographically == chronologically.
+        let times = trackpoint_times(&tcx.xml);
+        assert_eq!(times.len(), 5, "trackpoint count");
+        for w in times.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "times must strictly increase: {} !> {}",
+                w[1],
+                w[0]
+            );
+        }
+
+        // Lap total equals the last Trackpoint's elapsed seconds (single source).
+        // 4 increments of +1 s from index-driven clamp -> 4 s.
+        assert!(
+            tcx.xml.contains("<TotalTimeSeconds>4</TotalTimeSeconds>"),
+            "Lap total derives from the strictly-increasing series"
+        );
     }
 }
